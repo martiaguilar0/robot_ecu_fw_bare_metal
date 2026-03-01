@@ -46,8 +46,8 @@ typedef struct {
     float out_max;
 } PID_TypeDef;
 
-PID_TypeDef pid_l = {1.0f, 0.1f, 0.01f, 0.0f, 0.0f, 0.0f, 65535.0f}; // Ajusta Kp, Ki, Kd
-PID_TypeDef pid_r = {1.0f, 0.1f, 0.01f, 0.0f, 0.0f, 0.0f, 65535.0f};
+PID_TypeDef pid_l = {1.0f, 0.1f, 0.01f, 0.0f, 0.0f, 0.0f, 8399.0f};
+PID_TypeDef pid_r = {1.0f, 0.1f, 0.01f, 0.0f, 0.0f, 0.0f, 8399.0f};
 
 
 
@@ -150,6 +150,20 @@ void ICM20948_Init() {
     data = 0x20; HAL_I2C_Mem_Write(&hi2c1, ICM20948_ADDR, 0x7F, 1, &data, 1, 10);
     data = 0x01; HAL_I2C_Mem_Write(&hi2c1, ICM20948_ADDR, 0x14, 1, &data, 1, 10);
     data = 0x00; HAL_I2C_Mem_Write(&hi2c1, ICM20948_ADDR, 0x7F, 1, &data, 1, 10);
+
+    // 1. Seleccionar Banco 3 para configurar el I2C Maestro del ICM (si usas modo bypass es distinto)
+    uint8_t reg = 0x30; HAL_I2C_Mem_Write(&hi2c1, ICM20948_ADDR, 0x7F, 1, &reg, 1, 10);
+
+    // 2. Si estás usando el magnetómetro directamente (Modo Bypass), asegúrate de activarlo:
+    reg = 0x00; HAL_I2C_Mem_Write(&hi2c1, ICM20948_ADDR, 0x7F, 1, &reg, 1, 10); // Volver a Banco 0
+    reg = 0x02; HAL_I2C_Mem_Write(&hi2c1, ICM20948_ADDR, 0x0F, 1, &reg, 1, 10); // Activar Bypass
+
+    // 3. Configurar Magnetómetro (AK09916) en Modo Continuo 100Hz
+    // Registro CNTL2 (0x31) del Magnetómetro -> Valor 0x08 (Modo 4: 100Hz)
+    uint8_t mag_init = 0x08;
+    HAL_I2C_Mem_Write(&hi2c1, MAG_ADDR, 0x31, 1, &mag_init, 1, 10);
+
+
 }
 
 void IMU_Read_Fast() {
@@ -180,44 +194,64 @@ void IMU_Read_Mag() {
 }
 /* USER CODE END 0 */
 
+/* Incluye el resto de tu código (Headers, PV, etc.) hasta llegar al main */
+
 int main(void) {
     HAL_Init();
     SystemClock_Config();
 
+    // 1. Espera de cortesía para estabilidad eléctrica
+    HAL_Delay(200);
+
+    // 2. Inicializar GPIO y DMA (Base para todo lo demás)
     MX_GPIO_Init();
     MX_DMA_Init();
-    MX_TIM1_Init(); // Ahora sí está definida abajo
-    MX_TIM2_Init();
-    MX_TIM3_Init();
 
-    MX_TIM4_Init();
-
-    MX_TIM5_Init();
+    // 3. UARTs (Configurarlas temprano)
     MX_USART2_UART_Init();
-    MX_I2C1_Init();
-    MX_ADC1_Init();
     MX_USART6_UART_Init();
 
-    /* USER CODE BEGIN 2 */
+    // 4. I2C con Reset para evitar bloqueos del bus
+    HAL_I2C_DeInit(&hi2c1);
+    HAL_Delay(10);
+    MX_I2C1_Init();
     ICM20948_Init();
 
+    // 5. Timers y ADC
+    MX_TIM1_Init();
+    MX_TIM2_Init();
+    MX_TIM3_Init();
+    MX_TIM4_Init();
+    MX_TIM5_Init();
+    MX_ADC1_Init();
+
+    /* USER CODE BEGIN 2 */
     HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buffer, 2);
     HAL_UART_Receive_DMA(&huart6, gps_rx_buffer, sizeof(gps_rx_buffer));
 
+    uart_ready = 1;
     HAL_UART_Receive_DMA(&huart2, raw_rx_buffer, sizeof(Command_t));
 
     HAL_TIM_Base_Start(&htim3);
-    HAL_TIM_Base_Start_IT(&htim4);
-
-    //HAL_NVIC_DisableIRQ(EXTI0_IRQn);
+    HAL_TIM_Base_Start_IT(&htim4); // Arranca el PID
 
     HAL_TIM_Encoder_Start(&htim2, TIM_CHANNEL_ALL);
     HAL_TIM_Encoder_Start(&htim5, TIM_CHANNEL_ALL);
+
+    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
     /* USER CODE END 2 */
 
     while (1) {
         uint32_t current_time = HAL_GetTick();
 
+        // Blink de diagnóstico
+        if (current_time - last_led_tick >= 500) {
+            last_led_tick = current_time;
+            HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+        }
+
+        // Lectura de IMU y Telemetría
         if (imu_data_ready_flag == 1) {
             imu_data_ready_flag = 0;
             IMU_Read_Fast();
@@ -228,15 +262,26 @@ int main(void) {
             }
         }
 
+        // Lazo lento (Mag y GPS)
         if (current_time - last_slow_loop >= 10) {
             last_slow_loop = current_time;
-            uint32_t temp_ts = __HAL_TIM_GET_COUNTER(&htim3);
             IMU_Read_Mag();
-            last_mag_bat_ts = temp_ts;
             parse_gps_simple();
         }
-    }
-}
+
+        // --- WATCHDOG DE UART ---
+        static uint32_t last_tx_check = 0;
+        if (current_time - last_tx_check > 500) {
+            last_tx_check = current_time;
+            if (uart_ready == 0) {
+                HAL_UART_AbortTransmit(&huart2);
+                uart_ready = 1;
+            }
+        }
+    } // <--- AQUÍ FALTABA ESTA LLAVE (Cierre del while)
+} // <--- AQUÍ FALTABA ESTA LLAVE (Cierre del main)
+
+/* A partir de aquí, el resto de tus funciones MX_... Init y Callbacks se compilarán correctamente */
 
 /* --- CONFIGURACIÓN DE RELOJ --- */
 void SystemClock_Config(void) {
@@ -270,18 +315,52 @@ void SystemClock_Config(void) {
 static void MX_TIM1_Init(void) {
   TIM_ClockConfigTypeDef sClockSourceConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+  TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
 
   htim1.Instance = TIM1;
   htim1.Init.Prescaler = 0;
   htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim1.Init.Period = 65535;
+  htim1.Init.Period = 8399;                // 84MHz / (8399+1) = 10 kHz
   htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  HAL_TIM_Base_Init(&htim1);
+  htim1.Init.RepetitionCounter = 0;
+  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim1) != HAL_OK) Error_Handler();
+
   sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-  HAL_TIM_ConfigClockSource(&htim1, &sClockSourceConfig);
+  if (HAL_TIM_ConfigClockSource(&htim1, &sClockSourceConfig) != HAL_OK) Error_Handler();
+
+  // --- Aquí inicializamos el módulo PWM ---
+  if (HAL_TIM_PWM_Init(&htim1) != HAL_OK) Error_Handler();
+
+  // --- Configuración básica PWM CH1 y CH2 ---
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;                     // Duty inicial = 0%
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
+  sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
+  sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_1) != HAL_OK) Error_Handler();
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_2) != HAL_OK) Error_Handler();
+
+  // --- Configuración del maestro ---
   sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig);
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK) Error_Handler();
+
+  // --- Break/DeadTime: activar MOE ---
+  sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
+  sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
+  sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
+  sBreakDeadTimeConfig.DeadTime = 0;
+  sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
+  sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
+  sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_ENABLE; // <-- Habilita MOE automáticamente
+  if (HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBreakDeadTimeConfig) != HAL_OK) Error_Handler();
+
+  // --- Post init para GPIO (si usas HAL_TIM_MspPostInit) ---
+  HAL_TIM_MspPostInit(&htim1);
 }
 
 static void MX_ADC1_Init(void) {
@@ -424,6 +503,17 @@ static void MX_GPIO_Init(void) {
 
   HAL_NVIC_SetPriority(EXTI0_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(EXTI0_IRQn);
+
+  /* --- AQUÍ ESTÁ EL ARREGLO PARA EL PWM --- */
+    /* 4. Configurar PA8 y PA9 como salidas del TIM1 */
+    GPIO_InitStruct.Pin = GPIO_PIN_8 | GPIO_PIN_9;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;            // MODO ALTERNATE FUNCTION
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    GPIO_InitStruct.Alternate = GPIO_AF1_TIM1;         // CONECTAR AL TIMER 1
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+
 }
 
 /* --- HELPERS --- */
@@ -533,24 +623,33 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
   }
 
   if (htim->Instance == TIM4) {
-        // 1. Obtener posición actual
-        int32_t current_l = (int32_t)__HAL_TIM_GET_COUNTER(&htim2);
-        int32_t current_r = (int32_t)__HAL_TIM_GET_COUNTER(&htim5);
+      // 1. Obtener posición actual (Lectura directa como uint32_t)
+      uint32_t current_l = __HAL_TIM_GET_COUNTER(&htim2);
+      uint32_t current_r = __HAL_TIM_GET_COUNTER(&htim5);
 
-        // 2. Calcular Delta (Velocidad medida en pulsos/ms)
-        float vel_l = (float)(current_l - prev_enc_l);
-        float vel_r = (float)(current_r - prev_enc_r);
+      /* 2. Calcular Delta con manejo de Rollover.
+       * Al restar dos uint32_t y convertir el resultado a int32_t,
+       * el compilador gestiona automáticamente si el contador dio la vuelta.
+       * Ejemplo: 0 - 4294967295 resultará en 1. */
+      int32_t diff_l = (int32_t)(current_l - (uint32_t)prev_enc_l);
+      int32_t diff_r = (int32_t)(current_r - (uint32_t)prev_enc_r);
 
-        // Guardar para la próxima iteración
-        prev_enc_l = current_l;
-        prev_enc_r = current_r;
+      // 3. Convertir a velocidad (float) para el PID
+      float vel_l = (float)diff_l;
+      float vel_r = (float)diff_r;
 
-        // 3. Ejecutar PID con la VELOCIDAD calculada
-        float control_l = PID_Compute(&pid_l, setpoint_l, vel_l);
-        float control_r = PID_Compute(&pid_r, setpoint_r, vel_r);
+      // Guardar para la próxima iteración (cast a int32_t para mantener tu tipo de variable)
+      prev_enc_l = (int32_t)current_l;
+      prev_enc_r = (int32_t)current_r;
 
-        // 4. Actualizar PWM (TIM1)
-        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, (uint32_t)control_l);
-        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, (uint32_t)control_r);
-    }
+      // 4. Ejecutar PID
+      float control_l = PID_Compute(&pid_l, setpoint_l, vel_l);
+      float control_r = PID_Compute(&pid_r, setpoint_r, vel_r);
+
+      // 5. Actualizar PWM (TIM1)
+      //__HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, (uint32_t)control_l);
+      //__HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, (uint32_t)control_r);
+      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 4200);
+      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 4200);
+  }
 }
