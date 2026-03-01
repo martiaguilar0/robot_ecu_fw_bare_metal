@@ -21,6 +21,9 @@ DMA_HandleTypeDef hdma_i2c1_rx;
 TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim3;
+
+TIM_HandleTypeDef htim4;
+
 TIM_HandleTypeDef htim5;
 
 UART_HandleTypeDef huart2;
@@ -79,6 +82,7 @@ static void MX_I2C1_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_USART6_UART_Init(void);
 static void MX_TIM3_Init(void);
+static void MX_TIM4_Init(void);
 
 void build_telemetry_packet(void);
 void parse_gps_simple(void);
@@ -142,6 +146,9 @@ int main(void) {
     MX_TIM1_Init(); // Ahora sí está definida abajo
     MX_TIM2_Init();
     MX_TIM3_Init();
+
+    MX_TIM4_Init();
+
     MX_TIM5_Init();
     MX_USART2_UART_Init();
     MX_I2C1_Init();
@@ -154,6 +161,7 @@ int main(void) {
     HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buffer, 2);
     HAL_UART_Receive_DMA(&huart6, gps_rx_buffer, sizeof(gps_rx_buffer));
     HAL_TIM_Base_Start(&htim3);
+    HAL_TIM_Base_Start_IT(&htim4);
 
     //HAL_NVIC_DisableIRQ(EXTI0_IRQn);
 
@@ -312,6 +320,32 @@ static void MX_TIM5_Init(void) {
   HAL_TIM_Encoder_Init(&htim5, &sConfig);
 }
 
+
+
+static void MX_TIM4_Init(void) {
+  __HAL_RCC_TIM4_CLK_ENABLE(); // ¡CRÍTICO! Activa el reloj del periférico
+
+  htim4.Instance = TIM4;
+  htim4.Init.Prescaler = 83;      // 84MHz / 84 = 1MHz
+  htim4.Init.Period = 999;        // 1MHz / 1000 = 1kHz
+  htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim4.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim4) != HAL_OK) {
+    Error_Handler();
+  }
+
+  // Configurar la interrupción en el controlador (NVIC)
+  HAL_NVIC_SetPriority(TIM4_IRQn, 2, 0);
+  HAL_NVIC_EnableIRQ(TIM4_IRQn);
+}
+
+
+
+
+
+
+
 static void MX_DMA_Init(void) {
   __HAL_RCC_DMA1_CLK_ENABLE();
   __HAL_RCC_DMA2_CLK_ENABLE();
@@ -395,5 +429,18 @@ void Error_Handler(void) {
 }
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
-  if (htim->Instance == TIM10) { HAL_IncTick(); }
+  if (htim->Instance == TIM10) {
+      HAL_IncTick();
+  }
+
+  if (htim->Instance == TIM4) {
+	  static uint16_t interrupt_counter = 0;
+	  interrupt_counter++;
+	  if (interrupt_counter >= 100) {
+	            HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13); // Cambia el estado del LED
+	            interrupt_counter = 0;
+	  }
+      // AQUÍ VA TU PID
+      // Por ahora puedes poner un toggle de un pin para ver en osciloscopio
+  }
 }
