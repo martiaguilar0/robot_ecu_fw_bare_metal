@@ -2,7 +2,8 @@
 ADC1.Channel-6\#ChannelRegularConversion=ADC_CHANNEL_4
 ADC1.Channel-7\#ChannelRegularConversion=ADC_CHANNEL_4
 ADC1.ContinuousConvMode=ENABLE
-ADC1.IPParameters=Rank-6\#ChannelRegularConversion,master,Channel-6\#ChannelRegularConversion,SamplingTime-6\#ChannelRegularConversion,NbrOfConversionFlag,ScanConvMode,ContinuousConvMode,Rank-7\#ChannelRegularConversion,Channel-7\#ChannelRegularConversion,SamplingTime-7\#ChannelRegularConversion,NbrOfConversion
+ADC1.DMAContinuousRequests=DISABLE
+ADC1.IPParameters=Rank-6\#ChannelRegularConversion,master,Channel-6\#ChannelRegularConversion,SamplingTime-6\#ChannelRegularConversion,NbrOfConversionFlag,ScanConvMode,ContinuousConvMode,Rank-7\#ChannelRegularConversion,Channel-7\#ChannelRegularConversion,SamplingTime-7\#ChannelRegularConversion,NbrOfConversion,DMAContinuousRequests
 ADC1.NbrOfConversion=2
 ADC1.NbrOfConversionFlag=1
 ADC1.Rank-6\#ChannelRegularConversion=1
