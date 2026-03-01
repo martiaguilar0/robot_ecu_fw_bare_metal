@@ -32,6 +32,27 @@ DMA_HandleTypeDef hdma_usart2_rx;
 DMA_HandleTypeDef hdma_usart2_tx;
 DMA_HandleTypeDef hdma_usart6_rx;
 
+
+
+
+//pid
+typedef struct {
+    float Kp;
+    float Ki;
+    float Kd;
+    float integral;
+    float last_error;
+    float out_min;
+    float out_max;
+} PID_TypeDef;
+
+PID_TypeDef pid_l = {1.0f, 0.1f, 0.01f, 0.0f, 0.0f, 0.0f, 65535.0f}; // Ajusta Kp, Ki, Kd
+PID_TypeDef pid_r = {1.0f, 0.1f, 0.01f, 0.0f, 0.0f, 0.0f, 65535.0f};
+
+
+
+
+
 /* USER CODE BEGIN PV */
 volatile uint8_t uart_ready = 1;
 uint32_t last_slow_loop = 0;
@@ -42,8 +63,8 @@ uint8_t gps_rx_buffer[256];
 
 typedef struct __attribute__((packed)) {
     uint16_t header;     // 0xAAAA
-    uint32_t imu_ts;
-    uint32_t enc_ts;
+    uint32_t imu_enc_ts;
+    uint32_t mag_bat_ts;
     int16_t accel[3];
     int16_t gyro[3];
     int16_t magnet[3];
@@ -66,8 +87,30 @@ volatile uint8_t gps_fix = 0;
 
 volatile uint8_t imu_data_ready_flag = 0;
 volatile uint32_t last_imu_ts = 0;
+volatile uint32_t last_mag_bat_ts = 0;
 volatile int32_t snapshot_enc_l = 0;
 volatile int32_t snapshot_enc_r = 0;
+
+
+
+
+//for rx data
+typedef struct __attribute__((packed)) {
+    uint16_t header;      // 0xBBBB para diferenciar de la telemetría
+    float target_vel_l;   // Consigna Izquierda
+    float target_vel_r;   // Consigna Derecha
+    uint8_t checksum;     // Suma de bytes
+} Command_t;
+
+Command_t rx_cmd;
+volatile float setpoint_l = 0, setpoint_r = 0;
+uint8_t raw_rx_buffer[sizeof(Command_t)]; // Buffer intermedio para DMA
+
+
+int32_t prev_enc_l = 0;
+int32_t prev_enc_r = 0;
+
+
 /* USER CODE END PV */
 
 /* Prototypes */
@@ -160,6 +203,9 @@ int main(void) {
 
     HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buffer, 2);
     HAL_UART_Receive_DMA(&huart6, gps_rx_buffer, sizeof(gps_rx_buffer));
+
+    HAL_UART_Receive_DMA(&huart2, raw_rx_buffer, sizeof(Command_t));
+
     HAL_TIM_Base_Start(&htim3);
     HAL_TIM_Base_Start_IT(&htim4);
 
@@ -172,11 +218,6 @@ int main(void) {
     while (1) {
         uint32_t current_time = HAL_GetTick();
 
-        if (current_time - last_led_tick >= 500) {
-            last_led_tick = current_time;
-            HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
-        }
-
         if (imu_data_ready_flag == 1) {
             imu_data_ready_flag = 0;
             IMU_Read_Fast();
@@ -187,9 +228,11 @@ int main(void) {
             }
         }
 
-        if (current_time - last_slow_loop >= 100) {
+        if (current_time - last_slow_loop >= 10) {
             last_slow_loop = current_time;
+            uint32_t temp_ts = __HAL_TIM_GET_COUNTER(&htim3);
             IMU_Read_Mag();
+            last_mag_bat_ts = temp_ts;
             parse_gps_simple();
         }
     }
@@ -384,6 +427,43 @@ static void MX_GPIO_Init(void) {
 }
 
 /* --- HELPERS --- */
+
+float PID_Compute(PID_TypeDef *pid, float setpoint, float measured) {
+    float error = setpoint - measured;
+
+    // Proporcional
+    float P = pid->Kp * error;
+
+    // Integral (con anti-windup simple)
+    pid->integral += error;
+    float I = pid->Ki * pid->integral;
+
+    // Derivativo
+    float D = pid->Kd * (error - pid->last_error);
+    pid->last_error = error;
+
+    float output = P + I + D;
+
+    // Saturación (Limitar al rango del Timer PWM)
+    if (output > pid->out_max) output = pid->out_max;
+    else if (output < pid->out_min) output = pid->out_min;
+
+    return output;
+}
+
+
+
+
+uint8_t calculate_checksum(uint8_t* data, uint16_t len) {
+    uint8_t sum = 0;
+    for(uint16_t i = 0; i < len; i++) {
+        sum += data[i];
+    }
+    return sum;
+}
+
+
+
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
     if(GPIO_Pin == GPIO_PIN_0) {
         last_imu_ts = __HAL_TIM_GET_COUNTER(&htim3);
@@ -396,11 +476,30 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart) {
     if(huart->Instance == USART2) uart_ready = 1;
 }
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
+    if(huart->Instance == USART2) {
+        Command_t *temp = (Command_t*)raw_rx_buffer;
+
+        // 1. Validar Header
+        if(temp->header == 0xBBBB) {
+            // 2. Calcular checksum de los datos (excluyendo el último byte)
+            uint8_t calc = calculate_checksum(raw_rx_buffer, sizeof(Command_t) - 1);
+
+            if(calc == temp->checksum) {
+                // 3. Si es correcto, actualizamos las variables que usa el PID
+                setpoint_l = temp->target_vel_l;
+                setpoint_r = temp->target_vel_r;
+            }
+        }
+        // Nota: Con DMA circular no necesitas re-activar, pero si es modo normal usa:
+        // HAL_UART_Receive_DMA(&huart2, raw_rx_buffer, sizeof(Command_t));
+    }
+}
 
 void build_telemetry_packet(void) {
     tx_buffer.header = 0xAAAA;
-    tx_buffer.imu_ts = last_imu_ts;
-    tx_buffer.enc_ts = last_imu_ts;
+    tx_buffer.imu_enc_ts = last_imu_ts;
+    tx_buffer.mag_bat_ts = last_mag_bat_ts;
     tx_buffer.enc_l = snapshot_enc_l;
     tx_buffer.enc_r = snapshot_enc_r;
     tx_buffer.accel[0] = imu_accel_x;
@@ -434,13 +533,24 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
   }
 
   if (htim->Instance == TIM4) {
-	  static uint16_t interrupt_counter = 0;
-	  interrupt_counter++;
-	  if (interrupt_counter >= 100) {
-	            HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13); // Cambia el estado del LED
-	            interrupt_counter = 0;
-	  }
-      // AQUÍ VA TU PID
-      // Por ahora puedes poner un toggle de un pin para ver en osciloscopio
-  }
+        // 1. Obtener posición actual
+        int32_t current_l = (int32_t)__HAL_TIM_GET_COUNTER(&htim2);
+        int32_t current_r = (int32_t)__HAL_TIM_GET_COUNTER(&htim5);
+
+        // 2. Calcular Delta (Velocidad medida en pulsos/ms)
+        float vel_l = (float)(current_l - prev_enc_l);
+        float vel_r = (float)(current_r - prev_enc_r);
+
+        // Guardar para la próxima iteración
+        prev_enc_l = current_l;
+        prev_enc_r = current_r;
+
+        // 3. Ejecutar PID con la VELOCIDAD calculada
+        float control_l = PID_Compute(&pid_l, setpoint_l, vel_l);
+        float control_r = PID_Compute(&pid_r, setpoint_r, vel_r);
+
+        // 4. Actualizar PWM (TIM1)
+        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, (uint32_t)control_l);
+        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, (uint32_t)control_r);
+    }
 }
