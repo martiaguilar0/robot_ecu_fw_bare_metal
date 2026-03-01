@@ -125,6 +125,9 @@ uint32_t slow_loop_counter = 0;
 
 /* USER CODE END PV */
 
+uint32_t last_slow_loop = 0;
+
+
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
@@ -166,33 +169,40 @@ void ICM20948_Init() {
     data = 0x00;
     HAL_I2C_Mem_Write(&hi2c1, ICM20948_ADDR, 0x7F, 1, &data, 1, 10);
 
-    // 2. Reset por software (Importante para limpiar estados previos)
-    data = 0x80; // DEVICE_RESET = 1
+    // 2. Reset por software
+    data = 0x80;
     HAL_I2C_Mem_Write(&hi2c1, ICM20948_ADDR, 0x06, 1, &data, 1, 10);
     HAL_Delay(50);
 
     // 3. Quitar Sleep y seleccionar reloj automático
-    data = 0x01; // SLEEP = 0, CLKSEL = 1
+    data = 0x01;
     HAL_I2C_Mem_Write(&hi2c1, ICM20948_ADDR, 0x06, 1, &data, 1, 10);
     HAL_Delay(20);
 
-    // 4. DESACTIVAR I2C Master Interno (USER_CTRL)
-    // Esto es vital si usas el modo Bypass
+    // 4. DESACTIVAR I2C Master Interno (VITAL para modo Bypass)
     data = 0x00;
     HAL_I2C_Mem_Write(&hi2c1, ICM20948_ADDR, 0x03, 1, &data, 1, 10);
 
-    // 5. ACTIVAR Bypass para que el STM32 vea directamente el Magnetómetro
-    data = 0x02; // BYPASS_EN = 1
+    // 5. CONFIGURAR PIN INT Y BYPASS (Registro 0x0F)
+    // Queremos: INT Active High (bit7=0), Push-Pull (bit6=0),
+    // Pulse mode (bit5=0) Y BYPASS EN (bit1=1).
+    // Valor resultante: 0x02
+    data = 0x02;
     HAL_I2C_Mem_Write(&hi2c1, ICM20948_ADDR, 0x0F, 1, &data, 1, 10);
 
-    // 6. Configuración de Escala (Banco 2)
+    // 6. HABILITAR INTERRUPCIÓN DATA READY (Registro 0x11)
+    data = 0x01;
+    HAL_I2C_Mem_Write(&hi2c1, ICM20948_ADDR, 0x11, 1, &data, 1, 10);
+
+    // 7. Configuración de Escala (Banco 2)
     data = 0x20; // Seleccionar Banco 2
     HAL_I2C_Mem_Write(&hi2c1, ICM20948_ADDR, 0x7F, 1, &data, 1, 10);
 
     data = 0x01; // Accel ±2g, con filtro habilitado
     HAL_I2C_Mem_Write(&hi2c1, ICM20948_ADDR, 0x14, 1, &data, 1, 10);
 
-    data = 0x00; // Regresar a Banco 0 para que Read_Fast no falle
+    // 8. Regresar a Banco 0 para que las lecturas normales funcionen
+    data = 0x00;
     HAL_I2C_Mem_Write(&hi2c1, ICM20948_ADDR, 0x7F, 1, &data, 1, 10);
 }
 
@@ -300,12 +310,36 @@ int main(void)
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  while (1)
-  {
-    /* USER CODE END WHILE */
+    while (1)
+    {
+        uint32_t current_time = HAL_GetTick();
 
-    /* USER CODE BEGIN 3 */
-  }
+        // --- LECTURA POR INTERRUPCIÓN (Sincronizada con el sensor) ---
+        if (imu_data_ready_flag == 1)
+        {
+            imu_data_ready_flag = 0; // Reset del flag
+
+            // 1. Leer los datos de la IMU (el timestamp ya se tomó en el Callback)
+            IMU_Read_Fast();
+
+            // 2. Enviar a la Jetson Nano inmediatamente
+            if(uart_ready) {
+                uart_ready = 0;
+                build_telemetry_packet();
+                HAL_UART_Transmit_DMA(&huart2, (uint8_t*)&tx_buffer, sizeof(tx_buffer));
+            }
+        }
+
+        // --- LOOP LENTO: 10Hz (Cada 100ms) ---
+        if (current_time - last_slow_loop >= 100)
+        {
+            last_slow_loop = current_time;
+            HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+            IMU_Read_Mag();
+
+            // El GPS y ADC se actualizan por DMA en background, no hace falta hacer nada aquí
+        }
+    }
   /* USER CODE END 3 */
 }
 
@@ -794,6 +828,16 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
+  /*Configure GPIO pin : PB0 */
+  GPIO_InitStruct.Pin = GPIO_PIN_0;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI0_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI0_IRQn);
+
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
   /* USER CODE END MX_GPIO_Init_2 */
@@ -823,8 +867,8 @@ void build_telemetry_packet(void)
     tx_buffer.header = 0xAAAA;
 // USAR LOS TIMESTAMPS CAPTURADOS
 // Forzamos que solo los 16 bits del contador se envíen
-	tx_buffer.imu_ts = (uint32_t)(last_imu_ts & 0xFFFF);
-	tx_buffer.enc_ts = (uint32_t)(last_imu_ts & 0xFFFF);
+    tx_buffer.imu_ts = last_imu_ts;
+    tx_buffer.enc_ts = last_imu_ts;
 
 	// ASIGNAR LOS ENCODERS CAPTURADOS (Snapshot)
 	tx_buffer.enc_l = snapshot_enc_l;
