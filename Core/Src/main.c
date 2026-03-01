@@ -643,13 +643,15 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
       prev_enc_r = (int32_t)current_r;
 
       // 4. Ejecutar PID
-      float control_l = PID_Compute(&pid_l, setpoint_l, vel_l);
-      float control_r = PID_Compute(&pid_r, setpoint_r, vel_r);
+      //float control_l = PID_Compute(&pid_l, setpoint_l, vel_l);
+      //float control_r = PID_Compute(&pid_r, setpoint_r, vel_r);
 
       // 5. Actualizar PWM (TIM1)
       //__HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, (uint32_t)control_l);
       //__HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, (uint32_t)control_r);
-      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 4200);
-      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 4200);
+
+      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, (uint32_t)setpoint_l);
+      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, (uint32_t)setpoint_r);
+
   }
 }
